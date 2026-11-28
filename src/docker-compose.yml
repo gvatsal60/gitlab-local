@@ -1,0 +1,148 @@
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    hostname: gitlab.local
+    restart: unless-stopped
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost:8929'
+        gitlab_rails['gitlab_shell_ssh_port'] = 2222
+        prometheus_monitoring['enable'] = false
+        registry_external_url 'http://localhost:5050'
+      GITLAB_ROOT_PASSWORD: "Kx9#mP2vL8nQ4wR7"
+    ports:
+      - "8929:8929"
+      - "2222:22"
+      - "5050:5050"
+    volumes:
+      - gitlab_config:/etc/gitlab
+      - gitlab_logs:/var/log/gitlab
+      - gitlab_data:/var/opt/gitlab
+    shm_size: '256m'
+    healthcheck:
+      test: ["CMD", "/opt/gitlab/embedded/bin/curl", "-fsS", "http://localhost:8929/-/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+  gitlab-runner-init:
+    image: docker:24-cli
+    depends_on:
+      gitlab:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner_config:/etc/gitlab-runner
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+
+        if [ -f /etc/gitlab-runner/config.toml ]; then
+          echo "Runner config already exists, skipping registration"
+          exit 0
+        fi
+
+        GITLAB_CID=$$(docker ps --filter "label=com.docker.compose.service=gitlab" --filter "status=running" -q | head -1)
+        if [ -z "$$GITLAB_CID" ]; then
+          echo "ERROR: Could not find GitLab container"
+          exit 1
+        fi
+
+        echo "Waiting for GitLab to be fully ready..."
+        MAX_RETRIES=60
+        RETRY=0
+        while [ $$RETRY -lt $$MAX_RETRIES ]; do
+          if docker exec "$$GITLAB_CID" gitlab-rails runner "exit(User.find_by(username: 'root') ? 0 : 1)" 2>/dev/null; then
+            echo "GitLab is fully ready"
+            break
+          fi
+          RETRY=$$((RETRY + 1))
+          echo "  Waiting... ($$RETRY/$$MAX_RETRIES)"
+          sleep 10
+        done
+        if [ $$RETRY -ge $$MAX_RETRIES ]; then
+          echo "Root user not found after timeout, attempting to create it..."
+          docker exec "$$GITLAB_CID" gitlab-rails runner "
+          u = User.find_by(username: 'root')
+          if u.nil?
+            u = User.new(
+              username: 'root',
+              name: 'Administrator',
+              email: 'admin@example.com',
+              password: 'Kx9#mP2vL8nQ4wR7',
+              password_confirmation: 'Kx9#mP2vL8nQ4wR7',
+              admin: true,
+              confirmed_at: Time.now
+            )
+            u.skip_confirmation!
+            u.save!
+          end
+          puts u.persisted? ? 'ROOT_READY' : u.errors.full_messages
+          " 2>/dev/null
+          if ! docker exec "$$GITLAB_CID" gitlab-rails runner "exit(User.find_by(username: 'root') ? 0 : 1)" 2>/dev/null; then
+            echo "ERROR: Could not create root user"
+            exit 1
+          fi
+          echo "Root user created successfully"
+        fi
+
+        echo "Creating runner authentication token..."
+        RUBY_CODE='
+        u = User.find_by(username: "root")
+        r = Ci::Runner.new(
+          runner_type: Ci::Runner.runner_types[:instance_type],
+          description: "docker-runner",
+          tag_list: ["docker", "linux"],
+          run_untagged: true,
+          locked: false,
+          creator_id: u.id
+        )
+        r.save!
+        puts "TOKEN:#{r.token}"
+        '
+
+        RUNNER_TOKEN=$$(docker exec "$$GITLAB_CID" gitlab-rails runner "$$RUBY_CODE" 2>/dev/null | grep "TOKEN:" | cut -d: -f2)
+        if [ -z "$$RUNNER_TOKEN" ]; then
+          echo "ERROR: Failed to create runner token"
+          exit 1
+        fi
+        echo "Runner token: $${RUNNER_TOKEN:0:12}..."
+
+        cat > /etc/gitlab-runner/config.toml << TOML
+        concurrent = 1
+        check_interval = 0
+
+        [[runners]]
+          name = "docker-runner"
+          url = "http://gitlab:8929"
+          token = "$$RUNNER_TOKEN"
+          executor = "docker"
+          [runners.docker]
+            image = "docker:latest"
+            privileged = false
+            volumes = ["/cache"]
+            network_mode = "host"
+        TOML
+
+        echo "Runner configured successfully"
+  gitlab-runner:
+    image: gitlab/gitlab-runner:latest
+    restart: unless-stopped
+    depends_on:
+      gitlab-runner-init:
+        condition: service_completed_successfully
+    volumes:
+      - runner_config:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "gitlab-runner", "verify"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+volumes:
+  gitlab_config:
+  gitlab_logs:
+  gitlab_data:
+  runner_config:
