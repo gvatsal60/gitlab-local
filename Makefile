@@ -1,6 +1,13 @@
-.PHONY: up down logs logs-gitlab logs-runner ps restart build pull clean config status runner-status runner-verify runner-register runner-token runner-shell shell stop start
+# All targets are phony. "all" is the default target (same as `make up`).
+.PHONY: all test health up down logs logs-gitlab logs-runner ps restart build pull clean config status runner-status runner-verify runner-register runner-token runner-shell shell stop start
 
 COMPOSE := docker compose --project-directory src
+
+all: up
+
+# Validate the Compose file (needs GITLAB_ROOT_PASSWORD set).
+test:
+	$(COMPOSE) config -q
 
 up:
 	$(COMPOSE) up -d
@@ -35,15 +42,13 @@ clean:
 config:
 	$(COMPOSE) config
 
-status:
-	@echo "=== Containers ==="
-	$(COMPOSE) ps
-	@echo ""
-	@echo "=== GitLab Health ==="
-	@$(COMPOSE) exec gitlab /opt/gitlab/embedded/bin/curl -fsS http://localhost:8929/-/health || echo "GitLab not ready"
-	@echo ""
+status: ps health
 	@echo "=== Runner Verify ==="
 	@$(COMPOSE) exec gitlab-runner gitlab-runner verify || echo "Runner not verified"
+
+health:
+	@echo "=== GitLab Health ==="
+	@$(COMPOSE) exec gitlab /opt/gitlab/embedded/bin/curl -fsS http://localhost:8929/-/health || echo "GitLab not ready"
 
 shell:
 	$(COMPOSE) exec gitlab bash

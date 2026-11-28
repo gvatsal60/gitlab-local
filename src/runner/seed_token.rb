@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 # Ensures a limited-scope personal access token exists for runner bootstrap and
 # writes it to the shared bootstrap volume. Runs inside the GitLab container via
 # `gitlab-rails runner` (see post-reconfigure.sh). Based on GitLab's documented

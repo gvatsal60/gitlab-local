@@ -8,7 +8,7 @@ chown git:git /bootstrap
 chmod 700 /bootstrap
 
 echo "Seeding runner bootstrap token..."
-if ! gitlab-rails runner /opt/runner/seed-token.rb; then
-  echo "WARNING: failed to seed runner bootstrap token"
+if ! gitlab-rails runner /opt/runner/seed_token.rb; then
+    echo "WARNING: failed to seed runner bootstrap token"
 fi
 exit 0
