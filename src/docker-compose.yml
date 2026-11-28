@@ -1,5 +1,4 @@
 name: gitlab-local
-
 # Required: GITLAB_ROOT_PASSWORD (export it or put it in src/.env, which is git-ignored).
 # Optional:
 #   GITLAB_EXTERNAL_URL   URL clients use for the web UI (default http://localhost:8929)
@@ -13,7 +12,6 @@ name: gitlab-local
 #      personal access token into the private `runner_bootstrap` volume.
 #   2. gitlab-runner-init creates the instance runner via the REST API and writes
 #      config.toml with `gitlab-runner register`. No Docker socket is needed for this.
-
 services:
   gitlab:
     image: gitlab/gitlab-ce:latest
