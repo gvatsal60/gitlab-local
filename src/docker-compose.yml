@@ -1,3 +1,13 @@
+name: gitlab-local
+
+# Required: GITLAB_ROOT_PASSWORD (export it or put it in src/.env, which is git-ignored).
+# Optional:
+#   GITLAB_EXTERNAL_URL  URL clients use for the web UI (default http://localhost:8929)
+#   REGISTRY_EXTERNAL_URL URL clients use for the registry (default http://localhost:5050)
+#   GITLAB_BIND_ADDR     host interface to publish ports on (default 127.0.0.1)
+# For HTTPS, terminate TLS in a reverse proxy in front of ports 8929/5050 and set the
+# *_EXTERNAL_URL variables to the https:// hostnames. GitLab itself listens on plain HTTP.
+
 services:
   gitlab:
     image: gitlab/gitlab-ce:latest
@@ -5,19 +15,27 @@ services:
     restart: unless-stopped
     environment:
       GITLAB_OMNIBUS_CONFIG: |
-        external_url 'http://localhost:8929'
+        external_url '${GITLAB_EXTERNAL_URL:-http://localhost:8929}'
+        nginx['listen_port'] = 8929
+        nginx['listen_https'] = false
         gitlab_rails['gitlab_shell_ssh_port'] = 2222
         prometheus_monitoring['enable'] = false
-        registry_external_url 'http://localhost:5050'
-      GITLAB_ROOT_PASSWORD: "Kx9#mP2vL8nQ4wR7"
+        registry_external_url '${REGISTRY_EXTERNAL_URL:-http://localhost:5050}'
+        registry_nginx['listen_port'] = 5050
+        registry_nginx['listen_https'] = false
+      GITLAB_ROOT_PASSWORD: "${GITLAB_ROOT_PASSWORD:?Set GITLAB_ROOT_PASSWORD (see src/docker-compose.yml header)}"
     ports:
-      - "8929:8929"
-      - "2222:22"
-      - "5050:5050"
+      - "${GITLAB_BIND_ADDR:-127.0.0.1}:8929:8929"
+      - "${GITLAB_BIND_ADDR:-127.0.0.1}:2222:22"
+      - "${GITLAB_BIND_ADDR:-127.0.0.1}:5050:5050"
     volumes:
       - gitlab_config:/etc/gitlab
       - gitlab_logs:/var/log/gitlab
       - gitlab_data:/var/opt/gitlab
+    networks:
+      gitlab-net:
+        aliases:
+          - gitlab
     shm_size: '256m'
     healthcheck:
       test: ["CMD", "/opt/gitlab/embedded/bin/curl", "-fsS", "http://localhost:8929/-/health"]
@@ -29,101 +47,107 @@ services:
     image: docker:24-cli
     depends_on:
       gitlab:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner_config:/etc/gitlab-runner
+    networks:
+      - gitlab-net
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        set -e
+        set -eu
 
-        if [ -f /etc/gitlab-runner/config.toml ]; then
-          echo "Runner config already exists, skipping registration"
-          exit 0
+        CONFIG=/etc/gitlab-runner/config.toml
+
+        # Serialize concurrent init runs (e.g. `make runner-register` during `make up`).
+        exec 9>/etc/gitlab-runner/.init.lock
+        flock 9
+
+        # Find the GitLab container of *this* Compose project only.
+        PROJECT=$$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$$(hostname)")
+        if [ -z "$$PROJECT" ]; then
+          echo "ERROR: Could not determine Compose project"
+          exit 1
         fi
-
-        GITLAB_CID=$$(docker ps --filter "label=com.docker.compose.service=gitlab" --filter "status=running" -q | head -1)
+        GITLAB_CID=$$(docker ps -q \
+          --filter "label=com.docker.compose.project=$$PROJECT" \
+          --filter "label=com.docker.compose.service=gitlab" \
+          --filter "status=running" | head -1)
         if [ -z "$$GITLAB_CID" ]; then
           echo "ERROR: Could not find GitLab container"
           exit 1
         fi
 
-        echo "Waiting for GitLab to be fully ready..."
-        MAX_RETRIES=60
+        echo "Waiting for GitLab Rails and database to be ready..."
+        MAX_RETRIES=120
         RETRY=0
-        while [ $$RETRY -lt $$MAX_RETRIES ]; do
-          if docker exec "$$GITLAB_CID" gitlab-rails runner "exit(User.find_by(username: 'root') ? 0 : 1)" 2>/dev/null; then
-            echo "GitLab is fully ready"
-            break
-          fi
+        until docker exec "$$GITLAB_CID" gitlab-rails runner "exit(User.find_by(username: 'root') ? 0 : 1)" >/dev/null 2>&1; do
           RETRY=$$((RETRY + 1))
+          if [ $$RETRY -ge $$MAX_RETRIES ]; then
+            echo "ERROR: GitLab (root user) not ready after $$((MAX_RETRIES * 10))s. Check GITLAB_ROOT_PASSWORD and 'make logs-gitlab'."
+            exit 1
+          fi
           echo "  Waiting... ($$RETRY/$$MAX_RETRIES)"
           sleep 10
         done
-        if [ $$RETRY -ge $$MAX_RETRIES ]; then
-          echo "Root user not found after timeout, attempting to create it..."
-          docker exec "$$GITLAB_CID" gitlab-rails runner "
-          u = User.find_by(username: 'root')
-          if u.nil?
-            u = User.new(
-              username: 'root',
-              name: 'Administrator',
-              email: 'admin@example.com',
-              password: 'Kx9#mP2vL8nQ4wR7',
-              password_confirmation: 'Kx9#mP2vL8nQ4wR7',
-              admin: true,
-              confirmed_at: Time.now
-            )
-            u.skip_confirmation!
-            u.save!
-          end
-          puts u.persisted? ? 'ROOT_READY' : u.errors.full_messages
-          " 2>/dev/null
-          if ! docker exec "$$GITLAB_CID" gitlab-rails runner "exit(User.find_by(username: 'root') ? 0 : 1)" 2>/dev/null; then
-            echo "ERROR: Could not create root user"
-            exit 1
-          fi
-          echo "Root user created successfully"
-        fi
+        echo "GitLab is ready"
 
-        echo "Creating runner authentication token..."
+        # Reuse the existing instance runner if present, otherwise create it.
         RUBY_CODE='
         u = User.find_by(username: "root")
-        r = Ci::Runner.new(
-          runner_type: Ci::Runner.runner_types[:instance_type],
-          description: "docker-runner",
-          tag_list: ["docker", "linux"],
-          run_untagged: true,
-          locked: false,
-          creator_id: u.id
-        )
-        r.save!
+        r = Ci::Runner.instance_type.find_by(description: "docker-runner")
+        if r.nil?
+          r = Ci::Runner.new(
+            runner_type: Ci::Runner.runner_types[:instance_type],
+            description: "docker-runner",
+            tag_list: ["docker", "linux"],
+            run_untagged: false,
+            locked: false,
+            creator_id: u.id
+          )
+          r.save!
+        end
         puts "TOKEN:#{r.token}"
         '
-
-        RUNNER_TOKEN=$$(docker exec "$$GITLAB_CID" gitlab-rails runner "$$RUBY_CODE" 2>/dev/null | grep "TOKEN:" | cut -d: -f2)
+        RUNNER_TOKEN=$$(docker exec "$$GITLAB_CID" gitlab-rails runner "$$RUBY_CODE" 2>/dev/null | grep "^TOKEN:" | cut -d: -f2 | tr -d '\r')
         if [ -z "$$RUNNER_TOKEN" ]; then
-          echo "ERROR: Failed to create runner token"
+          echo "ERROR: Failed to obtain runner token"
           exit 1
         fi
-        echo "Runner token: $${RUNNER_TOKEN:0:12}..."
 
-        cat > /etc/gitlab-runner/config.toml << TOML
+        # Skip only if the saved config already holds the token GitLab has registered.
+        if [ -f "$$CONFIG" ] && grep -q "token = \"$$RUNNER_TOKEN\"" "$$CONFIG"; then
+          echo "Runner config is up to date, nothing to do"
+          exit 0
+        fi
+        [ -f "$$CONFIG" ] && echo "Runner config missing or stale, rewriting"
+
+        # Write to a temp file, validate, then atomically move into place.
+        TMP=$$(mktemp /etc/gitlab-runner/config.toml.XXXXXX)
+        cat > "$$TMP" << TOML
         concurrent = 1
         check_interval = 0
 
         [[runners]]
           name = "docker-runner"
           url = "http://gitlab:8929"
+          clone_url = "http://gitlab:8929"
           token = "$$RUNNER_TOKEN"
           executor = "docker"
           [runners.docker]
             image = "docker:latest"
             privileged = false
             volumes = ["/cache"]
-            network_mode = "host"
+            network_mode = "gitlab-local-net"
         TOML
+        if ! grep -q "token = \"$$RUNNER_TOKEN\"" "$$TMP"; then
+          rm -f "$$TMP"
+          echo "ERROR: Generated config failed validation"
+          exit 1
+        fi
+        chmod 600 "$$TMP"
+        mv "$$TMP" "$$CONFIG"
 
         echo "Runner configured successfully"
   gitlab-runner:
@@ -135,12 +159,18 @@ services:
     volumes:
       - runner_config:/etc/gitlab-runner
       - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - gitlab-net
     healthcheck:
       test: ["CMD", "gitlab-runner", "verify"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 30s
+networks:
+  # Fixed name so the runner's job containers can join it (network_mode above).
+  gitlab-net:
+    name: gitlab-local-net
 volumes:
   gitlab_config:
   gitlab_logs:

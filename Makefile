@@ -1,4 +1,4 @@
-.PHONY: up down logs ps restart build pull clean config status runner-status runner-verify shell
+.PHONY: up down logs logs-gitlab logs-runner ps restart build pull clean config status runner-status runner-verify runner-register runner-shell shell stop start
 
 COMPOSE := docker compose --project-directory src
 
@@ -23,8 +23,8 @@ ps:
 restart:
 	$(COMPOSE) restart
 
-build:
-	$(COMPOSE) build --no-cache
+# Services use prebuilt images, so "build" refreshes them.
+build: pull
 
 pull:
 	$(COMPOSE) pull
@@ -50,6 +50,10 @@ shell:
 
 runner-shell:
 	$(COMPOSE) exec gitlab-runner bash
+
+runner-status:
+	@$(COMPOSE) ps gitlab-runner-init gitlab-runner
+	@$(COMPOSE) exec gitlab-runner gitlab-runner verify
 
 runner-verify:
 	$(COMPOSE) exec gitlab-runner gitlab-runner verify
