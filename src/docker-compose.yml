@@ -1,3 +1,26 @@
+# Required: GITLAB_ROOT_PASSWORD (export it or put it in src/.env, which is git-ignored).
+#
+# Hostname: GitLab advertises http://gitlab.local:8929 (web, API, clone links) and
+# http://gitlab.local:5050 (registry). CI jobs resolve gitlab.local through a network
+# alias. On your machine, add this line to /etc/hosts once:
+#   127.0.0.1 gitlab.local
+#
+# Optional:
+#   GITLAB_EXTERNAL_URL   URL advertised for web/API (default http://gitlab.local:8929)
+#   REGISTRY_EXTERNAL_URL URL advertised for the registry (default http://gitlab.local:5050)
+#   GITLAB_BIND_ADDR      host interface to publish ports on (default 127.0.0.1)
+# For HTTPS, terminate TLS in a reverse proxy in front of ports 8929/5050 and set the
+# *_EXTERNAL_URL variables to the https:// hostnames. GitLab itself listens on plain HTTP.
+#
+# Runner bootstrap (see src/runner/):
+#   1. After reconfigure, the gitlab container seeds a limited-scope personal access
+#      token into the private `runner_bootstrap` volume (`make runner-token` re-seeds it).
+#   2. gitlab-runner-init creates the instance runner via the REST API and writes
+#      config.toml with `gitlab-runner register`. No Docker socket is needed for this.
+#
+# Isolation: CI jobs run on the gitlab-local-net bridge network, not the host network,
+# but they can still reach services listening on the Docker host's bridge gateway.
+# Do not run untrusted projects on this runner without host firewall rules.
 services:
   gitlab:
     image: gitlab/gitlab-ce:latest
@@ -5,19 +28,31 @@ services:
     restart: unless-stopped
     environment:
       GITLAB_OMNIBUS_CONFIG: |
-        external_url 'http://localhost:8929'
+        external_url '${GITLAB_EXTERNAL_URL:-http://gitlab.local:8929}'
+        nginx['listen_port'] = 8929
+        nginx['listen_https'] = false
         gitlab_rails['gitlab_shell_ssh_port'] = 2222
         prometheus_monitoring['enable'] = false
-        registry_external_url 'http://localhost:5050'
-      GITLAB_ROOT_PASSWORD: "Kx9#mP2vL8nQ4wR7"
+        registry_external_url '${REGISTRY_EXTERNAL_URL:-http://gitlab.local:5050}'
+        registry_nginx['listen_port'] = 5050
+        registry_nginx['listen_https'] = false
+      GITLAB_ROOT_PASSWORD: "${GITLAB_ROOT_PASSWORD:?Set GITLAB_ROOT_PASSWORD (see src/docker-compose.yml header)}"
+      GITLAB_POST_RECONFIGURE_SCRIPT: "sh /opt/runner/post-reconfigure.sh"
     ports:
-      - "8929:8929"
-      - "2222:22"
-      - "5050:5050"
+      - "${GITLAB_BIND_ADDR:-127.0.0.1}:8929:8929"
+      - "${GITLAB_BIND_ADDR:-127.0.0.1}:2222:22"
+      - "${GITLAB_BIND_ADDR:-127.0.0.1}:5050:5050"
     volumes:
       - gitlab_config:/etc/gitlab
       - gitlab_logs:/var/log/gitlab
       - gitlab_data:/var/opt/gitlab
+      - runner_bootstrap:/bootstrap
+      - ./runner:/opt/runner:ro
+    networks:
+      gitlab-net:
+        aliases:
+          - gitlab
+          - gitlab.local
     shm_size: '256m'
     healthcheck:
       test: ["CMD", "/opt/gitlab/embedded/bin/curl", "-fsS", "http://localhost:8929/-/health"]
@@ -26,106 +61,21 @@ services:
       retries: 10
       start_period: 300s
   gitlab-runner-init:
-    image: docker:24-cli
+    image: gitlab/gitlab-runner:latest
+    # Starts with GitLab; runner-init.sh waits (up to WAIT_SECS) for the API itself.
     depends_on:
       gitlab:
         condition: service_started
+    entrypoint: ["/bin/sh", "/opt/runner/runner-init.sh"]
+    environment:
+      GITLAB_URL: http://gitlab:8929
+      RUNNER_NETWORK: gitlab-local-net
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - runner_config:/etc/gitlab-runner
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-
-        if [ -f /etc/gitlab-runner/config.toml ]; then
-          echo "Runner config already exists, skipping registration"
-          exit 0
-        fi
-
-        GITLAB_CID=$$(docker ps --filter "label=com.docker.compose.service=gitlab" --filter "status=running" -q | head -1)
-        if [ -z "$$GITLAB_CID" ]; then
-          echo "ERROR: Could not find GitLab container"
-          exit 1
-        fi
-
-        echo "Waiting for GitLab to be fully ready..."
-        MAX_RETRIES=60
-        RETRY=0
-        while [ $$RETRY -lt $$MAX_RETRIES ]; do
-          if docker exec "$$GITLAB_CID" gitlab-rails runner "exit(User.find_by(username: 'root') ? 0 : 1)" 2>/dev/null; then
-            echo "GitLab is fully ready"
-            break
-          fi
-          RETRY=$$((RETRY + 1))
-          echo "  Waiting... ($$RETRY/$$MAX_RETRIES)"
-          sleep 10
-        done
-        if [ $$RETRY -ge $$MAX_RETRIES ]; then
-          echo "Root user not found after timeout, attempting to create it..."
-          docker exec "$$GITLAB_CID" gitlab-rails runner "
-          u = User.find_by(username: 'root')
-          if u.nil?
-            u = User.new(
-              username: 'root',
-              name: 'Administrator',
-              email: 'admin@example.com',
-              password: 'Kx9#mP2vL8nQ4wR7',
-              password_confirmation: 'Kx9#mP2vL8nQ4wR7',
-              admin: true,
-              confirmed_at: Time.now
-            )
-            u.skip_confirmation!
-            u.save!
-          end
-          puts u.persisted? ? 'ROOT_READY' : u.errors.full_messages
-          " 2>/dev/null
-          if ! docker exec "$$GITLAB_CID" gitlab-rails runner "exit(User.find_by(username: 'root') ? 0 : 1)" 2>/dev/null; then
-            echo "ERROR: Could not create root user"
-            exit 1
-          fi
-          echo "Root user created successfully"
-        fi
-
-        echo "Creating runner authentication token..."
-        RUBY_CODE='
-        u = User.find_by(username: "root")
-        r = Ci::Runner.new(
-          runner_type: Ci::Runner.runner_types[:instance_type],
-          description: "docker-runner",
-          tag_list: ["docker", "linux"],
-          run_untagged: true,
-          locked: false,
-          creator_id: u.id
-        )
-        r.save!
-        puts "TOKEN:#{r.token}"
-        '
-
-        RUNNER_TOKEN=$$(docker exec "$$GITLAB_CID" gitlab-rails runner "$$RUBY_CODE" 2>/dev/null | grep "TOKEN:" | cut -d: -f2)
-        if [ -z "$$RUNNER_TOKEN" ]; then
-          echo "ERROR: Failed to create runner token"
-          exit 1
-        fi
-        echo "Runner token: $${RUNNER_TOKEN:0:12}..."
-
-        cat > /etc/gitlab-runner/config.toml << TOML
-        concurrent = 1
-        check_interval = 0
-
-        [[runners]]
-          name = "docker-runner"
-          url = "http://gitlab:8929"
-          token = "$$RUNNER_TOKEN"
-          executor = "docker"
-          [runners.docker]
-            image = "docker:latest"
-            privileged = false
-            volumes = ["/cache"]
-            network_mode = "host"
-        TOML
-
-        echo "Runner configured successfully"
+      - runner_bootstrap:/bootstrap
+      - ./runner:/opt/runner:ro
+    networks:
+      - gitlab-net
   gitlab-runner:
     image: gitlab/gitlab-runner:latest
     restart: unless-stopped
@@ -135,14 +85,21 @@ services:
     volumes:
       - runner_config:/etc/gitlab-runner
       - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - gitlab-net
     healthcheck:
       test: ["CMD", "gitlab-runner", "verify"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 30s
+networks:
+  # Fixed name so the runner's job containers can join it (RUNNER_NETWORK above).
+  gitlab-net:
+    name: gitlab-local-net
 volumes:
   gitlab_config:
   gitlab_logs:
   gitlab_data:
   runner_config:
+  runner_bootstrap:
