@@ -1,4 +1,4 @@
-.PHONY: up down logs logs-gitlab logs-runner ps restart build pull clean config status runner-status runner-verify runner-register runner-shell shell stop start
+.PHONY: up down logs logs-gitlab logs-runner ps restart build pull clean config status runner-status runner-verify runner-register runner-token runner-shell shell stop start
 
 COMPOSE := docker compose --project-directory src
 
@@ -60,6 +60,10 @@ runner-verify:
 
 runner-register:
 	$(COMPOSE) run --rm gitlab-runner-init
+
+# Re-seed the runner bootstrap token (e.g. after it expired) without restarting GitLab.
+runner-token:
+	$(COMPOSE) exec gitlab sh /opt/runner/post-reconfigure.sh
 
 stop:
 	$(COMPOSE) stop

@@ -1,17 +1,26 @@
-name: gitlab-local
 # Required: GITLAB_ROOT_PASSWORD (export it or put it in src/.env, which is git-ignored).
+#
+# Hostname: GitLab advertises http://gitlab.local:8929 (web, API, clone links) and
+# http://gitlab.local:5050 (registry). CI jobs resolve gitlab.local through a network
+# alias. On your machine, add this line to /etc/hosts once:
+#   127.0.0.1 gitlab.local
+#
 # Optional:
-#   GITLAB_EXTERNAL_URL   URL clients use for the web UI (default http://localhost:8929)
-#   REGISTRY_EXTERNAL_URL URL clients use for the registry (default http://localhost:5050)
+#   GITLAB_EXTERNAL_URL   URL advertised for web/API (default http://gitlab.local:8929)
+#   REGISTRY_EXTERNAL_URL URL advertised for the registry (default http://gitlab.local:5050)
 #   GITLAB_BIND_ADDR      host interface to publish ports on (default 127.0.0.1)
 # For HTTPS, terminate TLS in a reverse proxy in front of ports 8929/5050 and set the
 # *_EXTERNAL_URL variables to the https:// hostnames. GitLab itself listens on plain HTTP.
 #
 # Runner bootstrap (see src/runner/):
-#   1. After reconfigure, the gitlab container seeds a create_runner/manage_runner
-#      personal access token into the private `runner_bootstrap` volume.
+#   1. After reconfigure, the gitlab container seeds a limited-scope personal access
+#      token into the private `runner_bootstrap` volume (`make runner-token` re-seeds it).
 #   2. gitlab-runner-init creates the instance runner via the REST API and writes
 #      config.toml with `gitlab-runner register`. No Docker socket is needed for this.
+#
+# Isolation: CI jobs run on the gitlab-local-net bridge network, not the host network,
+# but they can still reach services listening on the Docker host's bridge gateway.
+# Do not run untrusted projects on this runner without host firewall rules.
 services:
   gitlab:
     image: gitlab/gitlab-ce:latest
@@ -19,12 +28,12 @@ services:
     restart: unless-stopped
     environment:
       GITLAB_OMNIBUS_CONFIG: |
-        external_url '${GITLAB_EXTERNAL_URL:-http://localhost:8929}'
+        external_url '${GITLAB_EXTERNAL_URL:-http://gitlab.local:8929}'
         nginx['listen_port'] = 8929
         nginx['listen_https'] = false
         gitlab_rails['gitlab_shell_ssh_port'] = 2222
         prometheus_monitoring['enable'] = false
-        registry_external_url '${REGISTRY_EXTERNAL_URL:-http://localhost:5050}'
+        registry_external_url '${REGISTRY_EXTERNAL_URL:-http://gitlab.local:5050}'
         registry_nginx['listen_port'] = 5050
         registry_nginx['listen_https'] = false
       GITLAB_ROOT_PASSWORD: "${GITLAB_ROOT_PASSWORD:?Set GITLAB_ROOT_PASSWORD (see src/docker-compose.yml header)}"
@@ -43,6 +52,7 @@ services:
       gitlab-net:
         aliases:
           - gitlab
+          - gitlab.local
     shm_size: '256m'
     healthcheck:
       test: ["CMD", "/opt/gitlab/embedded/bin/curl", "-fsS", "http://localhost:8929/-/health"]
@@ -52,16 +62,17 @@ services:
       start_period: 300s
   gitlab-runner-init:
     image: gitlab/gitlab-runner:latest
+    # Starts with GitLab; runner-init.sh waits (up to WAIT_SECS) for the API itself.
     depends_on:
       gitlab:
-        condition: service_healthy
+        condition: service_started
     entrypoint: ["/bin/sh", "/opt/runner/runner-init.sh"]
     environment:
       GITLAB_URL: http://gitlab:8929
       RUNNER_NETWORK: gitlab-local-net
     volumes:
       - runner_config:/etc/gitlab-runner
-      - runner_bootstrap:/bootstrap:ro
+      - runner_bootstrap:/bootstrap
       - ./runner:/opt/runner:ro
     networks:
       - gitlab-net
